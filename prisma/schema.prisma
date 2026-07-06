@@ -1,0 +1,142 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  passwordHash String
+  displayName  String
+  avatarColor  String   @default("#c9a55a")
+  avatarUrl    String?
+  isBot        Boolean  @default(false)
+  botKey       String?  @unique // internal bots: key into the code registry
+  apiKey       String?  @unique // external bots: socket auth token
+  botOwnerId   String? // external bots: the user who registered them
+  createdAt    DateTime @default(now())
+
+  hostedSessions  Session[]       @relation("HostedSessions")
+  sessionPlayers  SessionPlayer[]
+  handActions     HandAction[]
+}
+
+model Session {
+  id          String        @id @default(cuid())
+  name        String
+  hostId      String
+  host        User          @relation("HostedSessions", fields: [hostId], references: [id])
+  tableType   TableType     @default(HUMANS_ONLY)
+  status      SessionStatus @default(WAITING_BUYIN)
+  buyIn       Int
+  smallBlind  Int
+  bigBlind    Int
+  maxPlayers  Int           @default(9)
+  isVirtual   Boolean       @default(false)
+  createdAt   DateTime      @default(now())
+  startedAt   DateTime?
+  endedAt     DateTime?
+
+  players     SessionPlayer[]
+  hands       Hand[]
+}
+
+model SessionPlayer {
+  id             String         @id @default(cuid())
+  sessionId      String
+  session        Session        @relation(fields: [sessionId], references: [id])
+  userId         String
+  user           User           @relation(fields: [userId], references: [id])
+  seatNumber     Int
+  chips          Int            @default(0)
+  buyInAmount    Int
+  transferStatus TransferStatus @default(PENDING)
+  cashedOut      Boolean        @default(false)
+  cashOutRequested Boolean      @default(false)
+  cashOutAmount  Int?
+
+  @@unique([sessionId, userId])
+  @@unique([sessionId, seatNumber])
+}
+
+model Hand {
+  id             String     @id @default(cuid())
+  sessionId      String
+  session        Session    @relation(fields: [sessionId], references: [id])
+  handNumber     Int
+  dealerSeat     Int
+  smallBlindSeat Int
+  bigBlindSeat   Int
+  communityCards String     @default("[]")
+  pot            Int        @default(0)
+  status         HandStatus @default(PREFLOP)
+  startedAt      DateTime   @default(now())
+  endedAt        DateTime?
+  winnersJson    String?
+
+  actions HandAction[]
+
+  @@unique([sessionId, handNumber])
+}
+
+model HandAction {
+  id         String     @id @default(cuid())
+  handId     String
+  hand       Hand       @relation(fields: [handId], references: [id])
+  userId     String
+  user       User       @relation(fields: [userId], references: [id])
+  seatNumber Int
+  street     Street
+  action     ActionType
+  amount     Int        @default(0)
+  holeCards  String?
+  timestamp  DateTime   @default(now())
+}
+
+enum TableType {
+  HUMANS_ONLY
+  BOTS_ONLY
+  MIXED
+}
+
+enum SessionStatus {
+  WAITING_BUYIN
+  ACTIVE
+  PAUSED
+  ENDED
+}
+
+enum TransferStatus {
+  PENDING
+  SENT
+  CONFIRMED
+}
+
+enum HandStatus {
+  PREFLOP
+  FLOP
+  TURN
+  RIVER
+  SHOWDOWN
+  COMPLETE
+}
+
+enum Street {
+  PREFLOP
+  FLOP
+  TURN
+  RIVER
+}
+
+enum ActionType {
+  FOLD
+  CHECK
+  CALL
+  RAISE
+  ALL_IN
+  POST_SB
+  POST_BB
+}

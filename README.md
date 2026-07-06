@@ -1,36 +1,48 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# pocăr ♠
 
-## Getting Started
+Private, invite-only Texas Hold'em for friends. The app is a **ledger, not a wallet** —
+real-money buy-ins are sent directly to the host (Revolut etc.); the app only tracks
+who sent, who confirmed, and who cashed out. Play-money tables skip transfers entirely.
 
-First, run the development server:
+## Features
+
+- Real-time poker table (Socket.io): 9-max oval table, hole cards, community cards,
+  side pots, dealer rotation, 30s turn timer with server-side auto check/fold
+- Buy-in flow: player marks the transfer sent → host confirms → chips credited
+- Cash-out flow: player requests → host pays manually → confirms in app
+- Play money mode (no real transfers, chips credited on join)
+- Profile: display name, avatar color, per-category statistics
+  (real/play money, humans/mixed/bots)
+- Invite-only registration (`INVITE_CODE`)
+
+## Stack
+
+Next.js 16 (App Router) · TypeScript · Tailwind v4 · Socket.io (custom server) ·
+PostgreSQL + Prisma 7 · NextAuth v5
+
+## Setup
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
+createdb poker_app                       # local PostgreSQL
+cp .env.example .env.local               # then fill in values
+npm run db:push                          # sync Prisma schema
+npm run dev                              # tsx server.ts (NOT next dev)
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Environment
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+See `.env.example`. Required: `DATABASE_URL`, `NEXTAUTH_SECRET`, `NEXTAUTH_URL`, `INVITE_CODE`.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Commands
 
-## Learn More
+| Command | What it does |
+|---|---|
+| `npm run dev` | start dev server (custom `server.ts` with Socket.io) |
+| `npm run db:push` | sync schema → DB |
+| `npm run db:studio` | Prisma Studio GUI |
 
-To learn more about Next.js, take a look at the following resources:
+## Notes
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Game state is in-memory (`activeGames` map) — a server restart drops running hands.
+- All money values are stored in cents.
