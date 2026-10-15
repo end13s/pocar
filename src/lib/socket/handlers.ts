@@ -11,6 +11,8 @@ import { BotView, BotDecision } from "@/lib/bots/types"
 const activeGames = new Map<string, GameState>()
 // Turn timers: auto check/fold when a player runs out of time
 const turnTimers = new Map<string, NodeJS.Timeout>()
+// Whose turn it is and since when, so players who (re)join mid-hand can act
+const currentTurns = new Map<string, { userId: string; startedAt: number; timeoutMs: number }>()
 // Pending internal-bot "thinking" timers
 const botTimers = new Map<string, NodeJS.Timeout>()
 
@@ -49,6 +51,13 @@ export function registerSocketHandlers(io: IO) {
       const game = activeGames.get(sessionId)
       if (game) {
         emitGameState(socket, game, userId)
+        // The original next_turn event went out before this socket joined (page load,
+        // refresh, reconnect); without it the player to act sees no action buttons.
+        const turn = currentTurns.get(sessionId)
+        if (game.phase === "playing" && turn) {
+          const timeoutMs = Math.max(0, turn.timeoutMs - (Date.now() - turn.startedAt))
+          socket.emit("game_event", { type: "next_turn", userId: turn.userId, timeoutMs })
+        }
         // Hands pause while the room is empty — resume when someone joins
         if (game.phase === "ended") {
           setTimeout(() => startNextHand(io, sessionId), 1500)
@@ -400,6 +409,7 @@ function scheduleTurnTimer(io: IO, sessionId: string, events: GameEvent[]) {
   clearTurnTimer(sessionId)
   const turnEvent = [...events].reverse().find((e) => e.type === "next_turn")
   if (!turnEvent) return
+  currentTurns.set(sessionId, { userId: turnEvent.userId, startedAt: Date.now(), timeoutMs: turnEvent.timeoutMs })
 
   const timer = setTimeout(() => {
     turnTimers.delete(sessionId)
@@ -420,6 +430,7 @@ function clearTurnTimer(sessionId: string) {
   const timer = turnTimers.get(sessionId)
   if (timer) clearTimeout(timer)
   turnTimers.delete(sessionId)
+  currentTurns.delete(sessionId)
 }
 
 function clearBotTimer(sessionId: string) {
