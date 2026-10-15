@@ -1,6 +1,6 @@
 import { buildDeck, shuffle, Card } from "./deck"
-import { determineWinners } from "./evaluator"
-import { GameState, PlayerState, SidePot, buildSidePots, getActionablePlayers } from "./gameState"
+import { HandResult, bestHand } from "./evaluator"
+import { GameState, PlayerState, buildPotLayers, getActionablePlayers } from "./gameState"
 
 export type EngineAction =
   | { type: "fold" }
@@ -133,6 +133,9 @@ export function applyAction(state: GameState, userId: string, action: EngineActi
   if (playerIndex === -1) return { state, events }
 
   const player = actionable[playerIndex]
+  const legal = normalizeAction(state, player, action)
+  if (!legal) return { state, events }
+  action = legal
   player.hasActed = true
   events.push({ type: "player_action", userId, action, chips: player.chips })
 
@@ -179,7 +182,11 @@ export function applyAction(state: GameState, userId: string, action: EngineActi
   }
 
   const newCurrentBet = Math.max(state.currentBet, player.currentBet)
-  const newMinRaise = action.type === "raise" ? player.currentBet * 2 : state.minRaise
+  // Min raise (as a raise-to total) = current bet + the size of the last raise
+  const raisedBy = player.currentBet - state.currentBet
+  const newMinRaise = raisedBy > 0
+    ? player.currentBet + Math.max(raisedBy, state.minRaise - state.currentBet)
+    : state.minRaise
   const pot = players.reduce((sum, p) => sum + p.totalInPot, 0)
 
   const newState: GameState = {
@@ -194,6 +201,31 @@ export function applyAction(state: GameState, userId: string, action: EngineActi
   // Check if street is over
   const result = advanceIfStreetComplete(newState, events, player.seatNumber)
   return result
+}
+
+/**
+ * Turn a requested action into a legal one, or null to reject it. Clients (and bots)
+ * only choose an action; the engine decides what it is allowed to mean.
+ */
+function normalizeAction(state: GameState, player: PlayerState, action: EngineAction): EngineAction | null {
+  const toCall = state.currentBet - player.currentBet
+  switch (action.type) {
+    case "fold":
+    case "all_in":
+      return player.chips > 0 || action.type === "fold" ? action : null
+    case "check":
+      return toCall <= 0 ? action : null
+    case "call":
+      return toCall > 0 ? action : { type: "check" }
+    case "raise": {
+      const raiseTo = action.amount
+      if (!Number.isInteger(raiseTo)) return null
+      const maxTo = player.currentBet + player.chips
+      if (raiseTo >= maxTo) return { type: "all_in" }
+      if (raiseTo < state.minRaise || raiseTo <= state.currentBet) return null
+      return { type: "raise", amount: raiseTo }
+    }
+  }
 }
 
 function advanceIfStreetComplete(state: GameState, events: GameEvent[], actorSeat: number): EngineResult {
@@ -276,7 +308,6 @@ function advanceStreet(state: GameState, events: GameEvent[]): EngineResult {
 function endHand(state: GameState, events: GameEvent[], showdown: boolean): EngineResult {
   // Only players actually in the hand can win it (not sitting-out/waiting ones)
   const eligible = state.players.filter((p) => p.status === "active" || p.status === "all_in")
-  const { mainPot, sidePots } = buildSidePots(state.players)
   const winners: { userId: string; amount: number; handDescription?: string }[] = []
 
   if (eligible.length === 1) {
@@ -285,34 +316,49 @@ function endHand(state: GameState, events: GameEvent[], showdown: boolean): Engi
     winner.chips += state.pot
     winners.push({ userId: winner.userId, amount: state.pot })
   } else if (showdown) {
+    const hands = new Map<string, HandResult>(
+      eligible.map((p) => [p.userId, bestHand(p.holeCards, state.communityCards)])
+    )
     events.push({
       type: "showdown",
       results: eligible.map((p) => ({
         userId: p.userId,
         holeCards: p.holeCards,
-        handDescription: "",
+        handDescription: hands.get(p.userId)!.description,
       })),
     })
 
-    // Determine winners with evaluator
-    const showdownResults = determineWinners(
-      eligible.map((p) => ({ playerId: p.userId, holeCards: p.holeCards })),
-      state.communityCards
-    )
+    // Award each pot layer to the best hand among the players who paid into it
+    const payouts = new Map<string, number>()
+    for (const layer of buildPotLayers(state.players)) {
+      let contenders = layer.contributorIds.filter((id) => hands.has(id))
+      if (contenders.length === 0) contenders = [...hands.keys()] // only folded money in this layer
+      const best = Math.max(...contenders.map((id) => hands.get(id)!.score))
+      const layerWinners = orderFromDealer(state, contenders.filter((id) => hands.get(id)!.score === best))
+      const share = Math.floor(layer.amount / layerWinners.length)
+      let oddChips = layer.amount - share * layerWinners.length // go to the first winners left of the dealer
+      for (const id of layerWinners) {
+        payouts.set(id, (payouts.get(id) ?? 0) + share + (oddChips-- > 0 ? 1 : 0))
+      }
+    }
 
-    const totalPot = mainPot + sidePots.reduce((s, p) => s + p.amount, 0)
-    const split = Math.floor(totalPot / showdownResults.length)
-    const remainder = totalPot % showdownResults.length
-
-    showdownResults.forEach((r, i) => {
-      const player = state.players.find((p) => p.userId === r.playerId)!
-      const payout = split + (i === 0 ? remainder : 0)
-      player.chips += payout
-      winners.push({ userId: r.playerId, amount: payout, handDescription: r.hand.description })
-    })
+    for (const [userId, amount] of payouts) {
+      state.players.find((p) => p.userId === userId)!.chips += amount
+      winners.push({ userId, amount, handDescription: hands.get(userId)!.description })
+    }
   }
 
   const newState: GameState = { ...state, phase: "ended", players: state.players }
   events.push({ type: "hand_ended", winners })
   return { state: newState, events }
+}
+
+/** Sort user ids by seat, starting with the first seat left of the dealer. */
+function orderFromDealer(state: GameState, userIds: string[]): string[] {
+  const seatOf = (id: string) => state.players.find((p) => p.userId === id)!.seatNumber
+  const distance = (id: string) => {
+    const d = seatOf(id) - state.dealerSeat
+    return d > 0 ? d : d + 1000
+  }
+  return [...userIds].sort((a, b) => distance(a) - distance(b))
 }

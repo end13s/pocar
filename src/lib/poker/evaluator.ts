@@ -1,4 +1,4 @@
-import { Card, Rank, Suit, rankValue, parseCard } from "./deck"
+import { Card, rankValue, parseCard } from "./deck"
 
 export type HandRank =
   | "Royal Flush"
@@ -43,7 +43,6 @@ function getCombinations(cards: Card[], k: number): Card[][] {
 
 function evaluateFive(cards: Card[]): HandResult {
   const parsed = cards.map(parseCard)
-  const ranks = parsed.map((c) => c.rank)
   const suits = parsed.map((c) => c.suit)
   const values = parsed.map((c) => rankValue(c.rank)).sort((a, b) => b - a)
 

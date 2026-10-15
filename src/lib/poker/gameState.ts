@@ -61,28 +61,29 @@ export function getCurrentPlayer(state: GameState): PlayerState | null {
   return actionable[state.activePlayerIndex % actionable.length] ?? null
 }
 
-export function buildSidePots(players: PlayerState[]): { mainPot: number; sidePots: SidePot[] } {
+export interface PotLayer {
+  amount: number
+  contributorIds: string[]   // everyone who paid into this layer, folded players included
+}
+
+/**
+ * Split everything invested this hand into layers by contribution level: the main pot
+ * first, then one side pot per all-in level. A layer with a single contributor is an
+ * uncalled bet, which goes back to that player at showdown.
+ */
+export function buildPotLayers(players: PlayerState[]): PotLayer[] {
   const invested = players
     .filter((p) => p.totalInPot > 0)
     .map((p) => ({ userId: p.userId, amount: p.totalInPot }))
     .sort((a, b) => a.amount - b.amount)
 
-  let mainPot = 0
-  const sidePots: SidePot[] = []
+  const layers: PotLayer[] = []
   let prev = 0
-
-  for (let i = 0; i < invested.length; i++) {
-    const level = invested[i].amount
+  for (const { amount: level } of invested) {
     if (level <= prev) continue
     const contributors = invested.filter((p) => p.amount >= level)
-    const potSlice = (level - prev) * contributors.length
-    if (i === 0) {
-      mainPot = potSlice
-    } else {
-      sidePots.push({ amount: potSlice, eligiblePlayerIds: contributors.map((p) => p.userId) })
-    }
+    layers.push({ amount: (level - prev) * contributors.length, contributorIds: contributors.map((p) => p.userId) })
     prev = level
   }
-
-  return { mainPot, sidePots }
+  return layers
 }
