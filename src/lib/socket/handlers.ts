@@ -1,4 +1,5 @@
 import { Server, Socket } from "socket.io"
+import { getToken } from "next-auth/jwt"
 import { ServerToClientEvents, ClientToServerEvents } from "@/types/socket"
 import { prisma } from "@/lib/prisma"
 import { GameState, getCurrentPlayer, PlayerState } from "@/lib/poker/gameState"
@@ -24,26 +25,56 @@ const BOT_THINK_MAX_MS = 2200
 type IO = Server<ClientToServerEvents, ServerToClientEvents>
 type Sock = Socket<ClientToServerEvents, ServerToClientEvents>
 
+// Browsers are identified by their NextAuth session cookie, which the socket
+// handshake carries. Nothing the client claims about itself is trusted.
+async function userIdFromSessionCookie(cookie: string | undefined): Promise<string | undefined> {
+  const secret = process.env.AUTH_SECRET ?? process.env.NEXTAUTH_SECRET
+  if (!cookie || !secret) return undefined
+  // The cookie is __Secure- prefixed when the site is served over HTTPS
+  for (const secureCookie of [true, false]) {
+    const token = await getToken({ req: { headers: { cookie } }, secret, secureCookie })
+    if (typeof token?.userId === "string") return token.userId
+  }
+  return undefined
+}
+
 export function registerSocketHandlers(io: IO) {
-  // Resolve identity once per connection: browsers send auth.userId,
-  // external bots send auth.apiKey and get looked up in the DB.
+  // Resolve identity once per connection: browsers by their session cookie,
+  // external bots by auth.apiKey. Anyone else may watch a table but not act.
   io.use(async (socket, next) => {
-    const { userId, apiKey } = socket.handshake.auth as { userId?: string; apiKey?: string }
-    if (apiKey) {
-      const bot = await prisma.user.findUnique({ where: { apiKey } })
-      if (!bot) return next(new Error("Invalid API key"))
-      socket.data.userId = bot.id
-      return next()
+    try {
+      const { apiKey } = socket.handshake.auth as { apiKey?: string }
+      if (apiKey) {
+        const bot = await prisma.user.findUnique({ where: { apiKey } })
+        if (!bot) return next(new Error("Invalid API key"))
+        socket.data.userId = bot.id
+        return next()
+      }
+      socket.data.userId = await userIdFromSessionCookie(socket.handshake.headers.cookie)
+      next()
+    } catch (err) {
+      console.error("[socket] auth failed:", err)
+      next(new Error("Authentication failed"))
     }
-    socket.data.userId = userId
-    next()
   })
 
   io.on("connection", (socket: Sock) => {
     const userId = socket.data.userId as string | undefined
     if (userId) socket.emit("identity", { userId })
 
-    socket.on("join_session", async (sessionId) => {
+    // A throw in an async handler would be an unhandled rejection, which stops
+    // the whole server (every table) on current Node versions.
+    const safe = <A extends unknown[]>(handler: (...args: A) => Promise<void> | void) =>
+      async (...args: A) => {
+        try {
+          await handler(...args)
+        } catch (err) {
+          console.error("[socket] handler failed:", err)
+          socket.emit("error", "Something went wrong. Try again.")
+        }
+      }
+
+    socket.on("join_session", safe(async (sessionId) => {
       socket.join(sessionId)
       await broadcastSessionUpdate(io, sessionId)
       // Late joiners (already bought in) get seated for the next hand
@@ -66,36 +97,39 @@ export function registerSocketHandlers(io: IO) {
         // ACTIVE session with no in-memory game (server restarted) — rebuild from DB
         await restoreGameIfActive(io, sessionId)
       }
-    })
+    }))
 
-    socket.on("leave_session", (sessionId) => {
+    socket.on("leave_session", safe((sessionId) => {
       socket.leave(sessionId)
-    })
+    }))
 
-    socket.on("confirm_transfer_sent", async (sessionId) => {
+    socket.on("confirm_transfer_sent", safe(async (sessionId) => {
       if (!userId) return
-      await prisma.sessionPlayer.update({
-        where: { sessionId_userId: { sessionId, userId } },
+      // Only PENDING -> SENT; flipping a confirmed buy-in back to SENT would ask the host to credit it again
+      await prisma.sessionPlayer.updateMany({
+        where: { sessionId, userId, transferStatus: "PENDING" },
         data: { transferStatus: "SENT" },
       })
       await broadcastSessionUpdate(io, sessionId)
-    })
+    }))
 
-    socket.on("host_confirm_transfer", async ({ sessionId, userId: targetUserId }) => {
+    socket.on("host_confirm_transfer", safe(async ({ sessionId, userId: targetUserId }) => {
       if (!userId) return
       const session = await prisma.session.findUnique({ where: { id: sessionId } })
       if (!session || session.hostId !== userId) return
 
-      await prisma.sessionPlayer.update({
-        where: { sessionId_userId: { sessionId, userId: targetUserId } },
+      // Conditional update, so a double click cannot credit the buy-in twice
+      const { count } = await prisma.sessionPlayer.updateMany({
+        where: { sessionId, userId: targetUserId, transferStatus: { not: "CONFIRMED" }, cashedOut: false },
         data: { transferStatus: "CONFIRMED", chips: { increment: session.buyIn } },
       })
+      if (count === 0) return
       await broadcastSessionUpdate(io, sessionId)
       // Confirming a late joiner on a running table seats them for the next hand
       await addLatePlayerToGame(io, sessionId, targetUserId)
-    })
+    }))
 
-    socket.on("host_start_game", async (sessionId) => {
+    socket.on("host_start_game", safe(async (sessionId) => {
       if (!userId) return
       const session = await prisma.session.findUnique({
         where: { id: sessionId },
@@ -115,14 +149,14 @@ export function registerSocketHandlers(io: IO) {
 
       const gameState = buildGameState(sessionId, session, 0)
       dispatchResult(io, sessionId, startHand(gameState))
-    })
+    }))
 
-    socket.on("player_action", ({ sessionId, action }) => {
+    socket.on("player_action", safe(({ sessionId, action }) => {
       if (!userId) return
       applyPlayerAction(io, sessionId, userId, action)
-    })
+    }))
 
-    socket.on("sit_out", (sessionId) => {
+    socket.on("sit_out", safe((sessionId) => {
       if (!userId) return
       const game = activeGames.get(sessionId)
       if (!game) return
@@ -137,9 +171,9 @@ export function registerSocketHandlers(io: IO) {
       } else {
         broadcastGameState(io, sessionId, game)
       }
-    })
+    }))
 
-    socket.on("sit_back", (sessionId) => {
+    socket.on("sit_back", safe((sessionId) => {
       if (!userId) return
       const game = activeGames.get(sessionId)
       if (!game) return
@@ -151,9 +185,9 @@ export function registerSocketHandlers(io: IO) {
       if (game.phase === "ended") {
         setTimeout(() => startNextHand(io, sessionId), 1000)
       }
-    })
+    }))
 
-    socket.on("leave_table", async (sessionId) => {
+    socket.on("leave_table", safe(async (sessionId) => {
       if (!userId) return
       const session = await prisma.session.findUnique({
         where: { id: sessionId },
@@ -190,18 +224,18 @@ export function registerSocketHandlers(io: IO) {
         }
       }
       socket.leave(sessionId)
-    })
+    }))
 
-    socket.on("request_cashout", async (sessionId) => {
+    socket.on("request_cashout", safe(async (sessionId) => {
       if (!userId) return
       await prisma.sessionPlayer.updateMany({
         where: { sessionId, userId, cashedOut: false },
         data: { cashOutRequested: true },
       })
       await broadcastSessionUpdate(io, sessionId)
-    })
+    }))
 
-    socket.on("host_confirm_cashout", async ({ sessionId, userId: targetUserId }) => {
+    socket.on("host_confirm_cashout", safe(async ({ sessionId, userId: targetUserId }) => {
       if (!userId) return
       const session = await prisma.session.findUnique({ where: { id: sessionId } })
       if (!session || session.hostId !== userId) return
@@ -234,9 +268,9 @@ export function registerSocketHandlers(io: IO) {
         data: { cashedOut: true, cashOutRequested: false, cashOutAmount: chipsToPay, chips: 0 },
       })
       await broadcastSessionUpdate(io, sessionId)
-    })
+    }))
 
-    socket.on("host_end_session", async (sessionId) => {
+    socket.on("host_end_session", safe(async (sessionId) => {
       if (!userId) return
       const session = await prisma.session.findUnique({ where: { id: sessionId } })
       if (!session || session.hostId !== userId) return
@@ -249,7 +283,7 @@ export function registerSocketHandlers(io: IO) {
         data: { status: "ENDED", endedAt: new Date() },
       })
       await broadcastSessionUpdate(io, sessionId)
-    })
+    }))
   })
 }
 
